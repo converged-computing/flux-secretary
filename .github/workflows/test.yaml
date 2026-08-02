@@ -1,0 +1,67 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pre-commit black
+      - run: pre-commit run --all-files --show-diff-on-failure
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image: [noble, jammy]
+    container:
+      image: fluxrm/flux-core:${{ matrix.image }}
+      options: --user root
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Show the flux we are testing against
+        run: |
+          flux --version
+          flux python -c "import flux, sys; print(flux.__file__); print(sys.version)"
+
+      # Install with the interpreter flux ships its bindings for. The bindings
+      # are compiled, so a different python would import the package but not flux.
+      - name: Install
+        run: |
+          apt-get update && apt-get install -y python3-pip
+          flux python -m pip install --upgrade pip || true
+          flux python -m pip install . || flux python -m pip install . --break-system-packages
+
+      - name: Unit tests
+        run: flux python tests/test_unit.py
+
+      # A real instance for the duration of the test. --test-size gives several
+      # brokers on one node, which is enough to exercise multi node requests.
+      - name: Integration tests
+        run: flux start --test-size=4 flux python tests/test_integration.py
+
+      - name: End to end launch
+        run: |
+          flux start --test-size=4 \
+            flux python -m fluxsecretary.cli run --nodes 4 --deterministic -- hostname
+
+      # An unsatisfiable request must fail rather than be worked around: it is a
+      # placement problem, and hiding it would report a mis-scheduled job as fine.
+      - name: Unsatisfiable request fails
+        run: |
+          set +e
+          flux start --test-size=1 \
+            flux python -m fluxsecretary.cli run --nodes 1 --attempts 1 \
+              --deterministic -- /bin/false
+          rc=$?
+          set -e
+          test $rc -ne 0 || { echo "a failing job must not report success"; exit 1; }
