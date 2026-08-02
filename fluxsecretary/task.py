@@ -9,31 +9,57 @@ from behalf import AgentRunner, ConfirmFn, Task, ToolSpec
 
 from . import flux as fluxio
 from .launch import Plan
-from .report import Transcript
+from .report import Transcript, application_output, attempt_banner
 
 SYSTEM = """You launch an application inside a Flux allocation that has ALREADY been
 sized correctly by a scheduler. Your only job is to choose the launch parameters
-that fit the resources actually present.
+that fit the resources actually present. You may edit workload manager flags to
+optimize affinity, and add environment variables to fix issues with MPI.
 
 Call get_resources first: it reports the nodes, cores and GPUs this allocation
 really has. Do not assume. A task count computed outside the allocation is a
 guess and is usually what went wrong.
 
 Then call try_launch with nodes/tasks (and optionally cores_per_task). It submits and waits,
-and returns the exit code together with any Flux exceptions and the sequence of
-job events. Read those and decide what to change. Typical fixes: too many tasks
+and returns the exit code, any Flux exceptions, the job events, and the
+application's own stdout and stderr. Read the stderr first: a program that
+aborts usually says why, and that message often shows the failure has nothing to
+do with how the job was launched. Typical fixes: too many tasks
 for the cores present (reduce), one rank where the program needs several (raise),
 or omit tasks and let Flux size the job.
 
-You may change ONLY how the job is launched. On your first attempts you should not
-change the command, the application, or its problem size. If the job failed for a reason
-that has nothing to do with how it was launched, for example it was placed on
-hardware it cannot run on, do not try to work around it. Call give_up with the
-reason so the scheduler sees the real outcome. If the job is failing due to a subtle
-configuration issue (e.g., problem size done incorrectly) you MAY correct that after
-your first few attempts.
+On your first attempts you should not change the command, the application, or its problem size. 
+After that please do your best to get it working. A solution is NOT changing the initial intent 
+(e.g., a run on one node is not a solution to a fabric issue).
 
 Stop as soon as a launch succeeds."""
+
+
+def parse_env(value) -> dict:
+    """Environment from a mapping or a "K=V,K=V" string."""
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return {str(k): str(v) for k, v in value.items()}
+    out = {}
+    for pair in str(value).split(","):
+        pair = pair.strip()
+        if not pair:
+            continue
+        if "=" not in pair:
+            raise ValueError(
+                f"cannot parse environment {pair!r}: expected KEY=VALUE, "
+                f"comma separated"
+            )
+        k, _, v = pair.partition("=")
+        out[k.strip()] = v.strip()
+    return out
+
+
+def tail(text: str, limit: int = 4000) -> str:
+    """The last of a stream, which is where a failure says why."""
+    text = text or ""
+    return text if len(text) <= limit else "...(truncated)...\n" + text[-limit:]
 
 
 def _text(obj: Any) -> dict:
@@ -72,23 +98,56 @@ class LaunchTask(Task):
                         f"call give_up"
                     }
                 )
+            have = res.get("nodes") or 1
+            asked = int(a.get("nodes") or have)
+            if asked < min(have, self.want_nodes or have):
+                return _text(
+                    {
+                        "error": f"refusing {asked} nodes: the allocation holds "
+                        f"{have}. Fewer nodes is a different job, not a different "
+                        f"launch. Vary tasks or cores_per_task, or call give_up."
+                    }
+                )
+            try:
+                environment = parse_env(a.get("environment"))
+            except ValueError as e:
+                return _text({"error": str(e)})
+            for key, value in (
+                ("cpu_affinity", a.get("cpu_affinity")),
+                ("gpu_affinity", a.get("gpu_affinity")),
+            ):
+                if value and value != "per-task":
+                    return _text({"error": f"{key} must be unset or 'per-task'"})
             plan = Plan(
-                nodes=int(a.get("nodes") or res.get("nodes") or 1),
+                nodes=asked,
                 tasks=int(a["tasks"]) if a.get("tasks") else None,
                 cores_per_task=(
                     int(a["cores_per_task"]) if a.get("cores_per_task") else None
                 ),
+                gpus_per_task=(
+                    int(a["gpus_per_task"]) if a.get("gpus_per_task") else None
+                ),
+                environment=environment,
+                cpu_affinity=a.get("cpu_affinity") or None,
+                gpu_affinity=a.get("gpu_affinity") or None,
+                exclusive=bool(a.get("exclusive")),
                 why=a.get("reasoning", "agent"),
             )
+            attempt_banner(len(tr.attempts) + 1, plan.submit_command(self.command))
             out = fluxio.submit_and_wait(
                 self.command,
                 nodes=plan.nodes,
                 tasks=plan.tasks,
                 cores_per_task=plan.cores_per_task,
+                gpus_per_task=plan.gpus_per_task,
+                environment=plan.environment,
+                cpu_affinity=plan.cpu_affinity,
+                gpu_affinity=plan.gpu_affinity,
+                exclusive=plan.exclusive,
                 duration=self.timeout,
             )
             exc = (out.get("exceptions") or [{}])[0]
-            tr.add(
+            attempt = tr.add(
                 status="ok" if out["rc"] == 0 else "failed",
                 rc=out["rc"],
                 jobid=out.get("jobid"),
@@ -96,6 +155,9 @@ class LaunchTask(Task):
                 runtime_s=out.get("runtime"),
                 **plan.as_fields(),
             )
+            attempt["stdout"] = out.get("stdout", "")
+            attempt["stderr"] = out.get("stderr", "")
+            application_output(attempt["stdout"], attempt["stderr"], attempt["n"])
             if out["rc"] == 0:
                 self.outcome = {
                     "plan": plan.as_fields(),
@@ -115,6 +177,8 @@ class LaunchTask(Task):
                     "rc": out["rc"],
                     "exceptions": out.get("exceptions"),
                     "events": out.get("events"),
+                    "stderr": tail(out.get("stderr", "")),
+                    "stdout": tail(out.get("stdout", "")),
                 }
             )
 
@@ -132,8 +196,24 @@ class LaunchTask(Task):
             ToolSpec(
                 "try_launch",
                 "Submit the (fixed) command with these launch parameters and wait. "
-                "Returns the exit code and stderr. You cannot change the command.",
-                {"nodes": int, "tasks": int, "cores_per_task": int, "reasoning": str},
+                "Returns the exit code, stderr and stdout. You cannot change the "
+                "command, but everything about HOW it runs is yours: layout, "
+                "affinity, exclusivity, and environment. environment is the remedy "
+                "for transport and runtime problems, e.g. "
+                "'OMPI_MCA_pml=ob1,OMPI_MCA_btl=self,vader,tcp' or "
+                "'FI_PROVIDER=tcp'. Set variables that change how the job runs, "
+                "never ones that change what it computes.",
+                {
+                    "nodes": int,
+                    "tasks": int,
+                    "cores_per_task": int,
+                    "gpus_per_task": int,
+                    "environment": str,
+                    "cpu_affinity": str,
+                    "gpu_affinity": str,
+                    "exclusive": bool,
+                    "reasoning": str,
+                },
                 try_launch,
             ),
             ToolSpec(

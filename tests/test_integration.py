@@ -59,6 +59,17 @@ def test_exit_code_conversion():
     print("OK wait status conversion")
 
 
+def test_application_output_is_captured():
+    """The job's own stdout and stderr come back with the result."""
+    out = fluxio.submit_and_wait(
+        ["sh", "-c", "echo from-the-app; echo from-stderr >&2"], nodes=1, tasks=1
+    )
+    assert out["rc"] == 0, out
+    assert "from-the-app" in out["stdout"], out["stdout"]
+    assert "from-stderr" in out["stderr"], out["stderr"]
+    print("OK application output captured")
+
+
 if __name__ == "__main__":
     for fn in (
         test_resources_are_read_from_the_broker,
@@ -66,6 +77,7 @@ if __name__ == "__main__":
         test_unsatisfiable_request_has_a_fatal_alloc_exception_and_no_finish,
         test_nonzero_exit_is_reported_without_an_exception,
         test_exit_code_conversion,
+        test_application_output_is_captured,
     ):
         fn()
     print("\nintegration tests passed")

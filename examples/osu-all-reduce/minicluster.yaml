@@ -1,0 +1,25 @@
+apiVersion: flux-framework.org/v1alpha2
+kind: MiniCluster
+metadata:
+  name: osu-all-reduce
+spec:
+  size: 2
+
+  # The view must match or not be newer than the application container.
+  flux:
+    container:
+      image: ghcr.io/converged-computing/flux-view-ubuntu:tag-jammy
+
+  containers:
+      # Asking for 3 nodes on a 2 node cluster. The secretary will fix it :)
+    - image: ghcr.io/converged-computing/metric-osu-cpu:libfabric
+      launcher: true
+      command: flux-secretary run --nodes 3 --model us.anthropic.claude-opus-5 -- /opt/osu-benchmark/build.openmpi/libexec/osu-micro-benchmarks/mpi/collective/osu_allreduce
+      
+      # Could be installed into the view instead
+      commands:
+        pre: $(d=$(dirname $(command -v flux)); echo $d/$(ls $d | grep -E '^python3[.][0-9]+$' | sort -V | tail -1)) -m pip install --no-cache-dir flux-secretary[all]
+      volumes:
+        secretary-token:
+          path: /etc/flux-secretary
+          secretName: flux-secretary-token
