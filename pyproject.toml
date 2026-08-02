@@ -10,9 +10,10 @@ requires-python = ">=3.9"
 dependencies = ["behalf"]
 
 [project.optional-dependencies]
-claude = ["behalf[claude]"]
 aws = ["behalf[aws]"]
+claude = ["behalf[claude]"]
 gemini = ["behalf[gemini]"]
+all = ["behalf[all]"]
 
 [project.scripts]
 flux-secretary = "fluxsecretary.cli:main"

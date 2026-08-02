@@ -15,23 +15,12 @@ import sys
 from . import flux as fluxio
 from .launch import ladder
 from .report import Transcript, emit, note, section
-
-DEFAULT_TOKEN_FILE = "/etc/flux-secretary/token"
-
-
-def read_token(path):
-    """Token from a mounted secret file, else the environment. The MiniCluster
-    CRD's `environment` is plain key/value with no secretKeyRef, so a mounted
-    secret is the only way to get a token in without putting it in the CRD."""
-    for p in (path, DEFAULT_TOKEN_FILE):
-        if p and os.path.isfile(p):
-            tok = open(p).read().strip()
-            if tok:
-                return tok, f"file:{p}"
-    for var in ("ANTHROPIC_API_KEY", "FLUX_SECRETARY_TOKEN"):
-        if os.environ.get(var):
-            return os.environ[var], f"env:{var}"
-    return None, "none"
+from .token import (
+    DEFAULT_TOKEN_FILE,
+    export_token,
+    read_token,
+    resolve_backend,
+)
 
 
 def run_deterministic(command, want_nodes, tr, timeout, max_attempts):
@@ -120,6 +109,12 @@ def main(argv=None) -> int:
     )
     r.add_argument("--model", default=os.environ.get("FLUX_SECRETARY_MODEL"))
     r.add_argument(
+        "--token-env",
+        default=os.environ.get("FLUX_SECRETARY_TOKEN_ENV", ""),
+        help="environment variable to export the token as (default: chosen from "
+        "--backend, e.g. AWS_BEARER_TOKEN_BEDROCK)",
+    )
+    r.add_argument(
         "--deterministic", action="store_true", help="skip the agent entirely"
     )
     r.add_argument("command", nargs=argparse.REMAINDER)
@@ -135,9 +130,18 @@ def main(argv=None) -> int:
     emit("command", argv=" ".join(command), nodes=args.nodes)
 
     token, source = read_token(args.token_file)
-    use_agent = bool(token) and not args.deterministic
+    backend = resolve_backend(args.backend, source)
+    use_agent = bool(token) and bool(backend) and not args.deterministic
+    exported = export_token(token, backend, args.token_env) if token else "-"
     tr.mode = "agent" if use_agent else "deterministic"
-    emit("mode", mode=tr.mode, token=source, attempts_max=args.attempts)
+    emit(
+        "mode",
+        mode=tr.mode,
+        token=source,
+        exported_as=exported,
+        backend=backend or "-",
+        attempts_max=args.attempts,
+    )
 
     rc, jobid, reason = 1, None, ""
     if use_agent:
@@ -148,10 +152,13 @@ def main(argv=None) -> int:
                 tr,
                 args.timeout,
                 args.attempts,
-                args.backend,
+                backend,
                 args.model,
             )
-        except Exception as e:  # noqa: BLE001 - never let the agent break the run
+        # BaseException, not Exception: behalf exits with SystemExit on an
+        # unknown backend, and an agent problem must never end the run. The
+        # deterministic path is the whole reason a fallback exists.
+        except BaseException as e:  # noqa: BLE001
             note(f"agent unavailable ({e}); falling back to deterministic")
             tr.mode = "deterministic-fallback"
             emit("mode", mode=tr.mode, reason=str(e)[:200])
