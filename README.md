@@ -1,6 +1,7 @@
 # flux-secretary
 
 [![PyPI - Version](https://img.shields.io/pypi/v/flux-secretary)](https://badge.fury.io/py/flux-secretary)
+[![DOI](https://zenodo.org/badge/1319769497.svg)](https://doi.org/10.5281/zenodo.21757790)
 
 Runs a command inside a Flux allocation, correctly.
 
