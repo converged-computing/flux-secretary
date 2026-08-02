@@ -1,6 +1,10 @@
 # flux-secretary
 
+[![PyPI - Version](https://img.shields.io/pypi/v/flux-secretary)](https://badge.fury.io/py/flux-secretary)
+
 Runs a command inside a Flux allocation, correctly.
+
+![https://github.com/converged-computing/flux-secretary/blob/main/img/flux-secretary-small.png](https://github.com/converged-computing/flux-secretary/blob/main/img/flux-secretary-small.png)
 
 A scheduler decides *where* a job goes and *how big* it is. It cannot decide how
 to launch it (e.g., the ranks, mapping, flags). Those depend on what the runtime
