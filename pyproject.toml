@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flux-secretary"
+version = "0.1.0"
+description = "Launch-time agent that runs inside a Flux allocation: discovers the resources it was actually given, assembles the submit, monitors, and retries."
+requires-python = ">=3.9"
+dependencies = ["behalf"]
+
+[project.optional-dependencies]
+claude = ["behalf[claude]"]
+aws = ["behalf[aws]"]
+gemini = ["behalf[gemini]"]
+
+[project.scripts]
+flux-secretary = "fluxsecretary.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["fluxsecretary*"]
