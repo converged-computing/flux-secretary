@@ -1,9 +1,4 @@
-"""Structured, line-oriented output.
-
-Everything the secretary prints is greppable and machine-parsable: one record per
-line, ``FLUXSEC <kind> k=v ...``, and a final ``FLUXSEC json {...}`` carrying the
-whole transcript. Human readers can follow the lines; a harness parses the JSON.
-"""
+"""Structured, line-oriented output."""
 
 from __future__ import annotations
 

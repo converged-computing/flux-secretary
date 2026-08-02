@@ -1,9 +1,4 @@
-"""flux-secretary: run a command inside a Flux allocation, correctly.
-
-    flux-secretary run -- osu_allreduce -m 8:1048576
-
-Uses the agent by default and falls back to a deterministic submit.
-"""
+"""flux-secretary: run a command inside a Flux allocation, correctly."""
 
 from __future__ import annotations
 
@@ -58,10 +53,6 @@ def run_deterministic(command, want_nodes, tr, timeout, max_attempts):
         )
         if out["rc"] == 0:
             return 0, out.get("jobid"), ""
-        # No attempt is made to interpret why it failed. A launch that does not
-        # fit gets the next rung; a job that fails for reasons outside launching,
-        # such as being placed on the wrong hardware, fails every rung and exits
-        # non zero, which is the right answer.
         if exc.get("note"):
             note(str(exc["note"])[:500])
     return (
@@ -72,7 +63,7 @@ def run_deterministic(command, want_nodes, tr, timeout, max_attempts):
 
 
 def run_agent(command, want_nodes, tr, timeout, max_attempts, backend, model):
-    from behalf import make_runner  # imported lazily: optional dependency
+    from behalf import make_runner
 
     from .task import LaunchTask
 
@@ -155,9 +146,6 @@ def main(argv=None) -> int:
                 backend,
                 args.model,
             )
-        # BaseException, not Exception: behalf exits with SystemExit on an
-        # unknown backend, and an agent problem must never end the run. The
-        # deterministic path is the whole reason a fallback exists.
         except BaseException as e:  # noqa: BLE001
             note(f"agent unavailable ({e}); falling back to deterministic")
             tr.mode = "deterministic-fallback"

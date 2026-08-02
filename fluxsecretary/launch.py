@@ -1,10 +1,4 @@
-"""Choosing HOW to launch — never WHAT to run.
-
-The command is fixed by the caller and is never rewritten here. Only launch
-parameters (nodes, tasks, cores-per-task, flags) are chosen, which is the whole
-scope of this process: the allocation is already correct, so the only open
-question is how to fill it.
-"""
+"""Choosing HOW to launch — never WHAT to run."""
 
 from __future__ import annotations
 
@@ -31,12 +25,7 @@ class Plan:
 
 
 def ladder(res: dict, want_nodes: int | None = None) -> list[Plan]:
-    """Deterministic fallback: progressively weaker claims on the allocation.
-
-    Used when no token is available, and as the backstop when the agent gives up.
-    Ordered most-to-least specific, because the first plan that works is the one
-    that uses the allocation best.
-    """
+    """Deterministic fallback: progressively weaker claims on the allocation."""
     nodes = want_nodes or res.get("nodes") or 1
     nodes = min(nodes, res.get("nodes") or nodes)
     cores = res.get("cores") or 0
@@ -51,7 +40,6 @@ def ladder(res: dict, want_nodes: int | None = None) -> list[Plan]:
     if nodes > 1:
         plans.append(Plan(1, None, why="single node, last resort"))
 
-    # de-duplicate while preserving order
     seen, out = set(), []
     for p in plans:
         key = (p.nodes, p.tasks, p.cores_per_task)

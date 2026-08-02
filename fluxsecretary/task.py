@@ -1,9 +1,4 @@
-"""The launch task, as a behalf Task.
-
-behalf supplies the agent loop, tool dispatch, confirmation and the backend
-runners; this module adds only what is specific to launching inside a Flux
-allocation. Nothing here re-implements agent plumbing.
-"""
+"""The launch task, as a behalf Task."""
 
 from __future__ import annotations
 
@@ -114,8 +109,6 @@ class LaunchTask(Task):
                         "message": "launch succeeded; stop now",
                     }
                 )
-            # The exception is handed over as it came from Flux. Deciding whether
-            # it is a launch problem is the agent's job, not a string table's.
             return _text(
                 {
                     "status": "failed",

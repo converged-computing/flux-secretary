@@ -1,7 +1,4 @@
-"""Flux Python Handles
-Flux must be importable. Making it so is the environment's job. Run under
-flux python, or have the bindings on PYTHONPATH.
-"""
+"""Flux Python Handles"""
 
 from __future__ import annotations
 
@@ -58,11 +55,7 @@ def exit_code(status) -> int:
 
 
 def watch(h, jobid) -> dict:
-    """Follow the job eventlog until it is clean.
-    The eventlog is the record of what happened. Timestamps, the finish status
-    and any exceptions all come from it, so nothing has to be parsed out of
-    printed output.
-    """
+    """Follow the job eventlog until it is clean."""
     events, exceptions = [], []
     times, status = {}, None
 
@@ -100,10 +93,7 @@ def submit_and_wait(
     duration=None,
     h=None,
 ) -> dict:
-    """Submit via the SDK and wait for the job to finish.
-    A failed job is a RESULT, not an exception. The caller reasons about it.
-    Only genuine SDK or transport problems raise.
-    """
+    """Submit via the SDK and wait for the job to finish."""
     h = h or handle()
     spec = JobspecV1.from_command(
         command=list(command),
@@ -119,12 +109,8 @@ def submit_and_wait(
     jobid = flux.job.submit(h, spec, waitable=True)
     log = watch(h, jobid)
 
-    # Severity 0 is fatal and the job is terminated. Higher severities are
-    # advisory, so a job can log one and still finish successfully.
     fatal = [e for e in log["exceptions"] if e.get("severity") == 0]
 
-    # A job killed before it ran never reaches finish, so there is no status to
-    # read. Reporting 1 in that case is our convention, not something Flux says.
     if log["status"] is not None:
         rc = exit_code(log["status"])
     else:
