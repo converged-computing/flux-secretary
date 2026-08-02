@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flux-secretary"
-version = "0.0.1"
+version = "0.0.15"
 description = "Launch-time agent that runs inside a Flux allocation: discovers the resources it was actually given, assembles the submit, monitors, and retries."
 requires-python = ">=3.9"
 dependencies = ["behalf"]

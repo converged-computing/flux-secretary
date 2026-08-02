@@ -84,6 +84,18 @@ def watch(h, jobid) -> dict:
     }
 
 
+def job_output(h, jobid) -> dict:
+    """The application's stdout and stderr, once the job is done."""
+    try:
+        out = flux.job.job_output(h, jobid)
+    except Exception as e:
+        return {"stdout": "", "stderr": "", "error": str(e)}
+    return {
+        "stdout": getattr(out, "stdout", "") or "",
+        "stderr": getattr(out, "stderr", "") or "",
+    }
+
+
 def submit_and_wait(
     command,
     nodes=None,
@@ -91,6 +103,11 @@ def submit_and_wait(
     cores_per_task=None,
     gpus_per_task=None,
     duration=None,
+    environment=None,
+    cpu_affinity=None,
+    gpu_affinity=None,
+    exclusive=False,
+    cwd=None,
     h=None,
 ) -> dict:
     """Submit via the SDK and wait for the job to finish."""
@@ -101,10 +118,26 @@ def submit_and_wait(
         num_nodes=nodes,
         cores_per_task=cores_per_task or 1,
         gpus_per_task=gpus_per_task,
+        exclusive=bool(exclusive),
     )
-    spec.environment = dict(os.environ)
+    # The job's environment starts from ours, so the view and PATH survive, and
+    # anything the caller adds layers on top.
+    env = dict(os.environ)
+    env.update(environment or {})
+    spec.environment = env
     if duration:
         spec.duration = duration
+    if cwd:
+        spec.cwd = cwd
+    if cpu_affinity or gpu_affinity:
+        shell = spec.attributes["system"].get("shell", {})
+        options = shell.get("options", {})
+        if cpu_affinity:
+            options["cpu-affinity"] = cpu_affinity
+        if gpu_affinity:
+            options["gpu-affinity"] = gpu_affinity
+        shell["options"] = options
+        spec.attributes["system"]["shell"] = shell
 
     jobid = flux.job.submit(h, spec, waitable=True)
     log = watch(h, jobid)
@@ -116,6 +149,7 @@ def submit_and_wait(
     else:
         rc = 1
 
+    out = job_output(h, jobid)
     times = log["times"]
     info = {
         "jobid": str(jobid),
@@ -125,6 +159,8 @@ def submit_and_wait(
         "fatal": fatal,
         "events": [e["name"] for e in log["events"]],
         "eventlog": log["events"],
+        "stdout": out["stdout"],
+        "stderr": out["stderr"],
     }
     for name, key in (
         ("submit", "t_submit"),

@@ -9,6 +9,8 @@ import time
 
 PREFIX = "FLUXSEC"
 
+OUTPUT_LIMIT = 64 * 1024
+
 
 def _fmt(value):
     if isinstance(value, bool):
@@ -57,6 +59,12 @@ class Transcript:
         return attempt
 
     def finish(self, status, rc, reason="", jobid=None, job=None):
+        for a in self.attempts:
+            for k in ("stdout", "stderr"):
+                text = a.get(k) or ""
+                if len(text) > OUTPUT_LIMIT:
+                    a[k] = text[-OUTPUT_LIMIT:]
+                    a[k + "_truncated"] = True
         payload = {
             "status": status,
             "rc": rc,
@@ -83,3 +91,19 @@ class Transcript:
         final(payload)
         sys.stdout.flush()
         return payload
+
+
+def attempt_banner(n: int, command: str) -> None:
+    """Announce an attempt with the flux command it is equivalent to."""
+    print(f"{PREFIX} === attempt {n}: {command} ===", flush=True)
+
+
+def application_output(stdout: str, stderr: str, n: int = 0) -> None:
+    """Print the application's own output, unprefixed, between markers."""
+    label = f"attempt {n} " if n else "application "
+    for name, text in (("stdout", stdout), ("stderr", stderr)):
+        if not (text or "").strip():
+            continue
+        print(f"{PREFIX} === {label}{name} ===", flush=True)
+        print(text.rstrip("\n"), flush=True)
+        print(f"{PREFIX} === end {label}{name} ===", flush=True)

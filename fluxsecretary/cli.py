@@ -9,7 +9,7 @@ import sys
 
 from . import flux as fluxio
 from .launch import ladder
-from .report import Transcript, emit, note, section
+from .report import Transcript, application_output, attempt_banner, emit, note, section
 from .token import (
     DEFAULT_TOKEN_FILE,
     export_token,
@@ -32,18 +32,24 @@ def run_deterministic(command, want_nodes, tr, timeout, max_attempts):
         source=res.get("source"),
     )
     last = None
-    for plan in ladder(res, want_nodes)[:max_attempts]:
+    for n, plan in enumerate(ladder(res, want_nodes)[:max_attempts], 1):
+        attempt_banner(n, plan.submit_command(command))
         out = fluxio.submit_and_wait(
             command,
             nodes=plan.nodes,
             tasks=plan.tasks,
             cores_per_task=plan.cores_per_task,
+            gpus_per_task=plan.gpus_per_task,
+            environment=plan.environment,
+            cpu_affinity=plan.cpu_affinity,
+            gpu_affinity=plan.gpu_affinity,
+            exclusive=plan.exclusive,
             duration=timeout,
             h=h,
         )
         last = out
         exc = (out.get("exceptions") or [{}])[0]
-        tr.add(
+        attempt = tr.add(
             status="ok" if out["rc"] == 0 else "failed",
             rc=out["rc"],
             jobid=out.get("jobid"),
@@ -51,6 +57,9 @@ def run_deterministic(command, want_nodes, tr, timeout, max_attempts):
             runtime_s=out.get("runtime"),
             **plan.as_fields(),
         )
+        attempt["stdout"] = out.get("stdout", "")
+        attempt["stderr"] = out.get("stderr", "")
+        application_output(attempt["stdout"], attempt["stderr"], n)
         if out["rc"] == 0:
             return 0, out.get("jobid"), ""
         if exc.get("note"):
@@ -58,7 +67,7 @@ def run_deterministic(command, want_nodes, tr, timeout, max_attempts):
     return (
         (last or {}).get("rc", 1),
         (last or {}).get("jobid"),
-        "no launch configuration worked",
+        "every layout that fits the allocation failed; this is not a launch " "problem",
     )
 
 
@@ -92,7 +101,7 @@ def main(argv=None) -> int:
         default=None,
         help="requested node count (default: all the allocation has)",
     )
-    r.add_argument("--attempts", type=int, default=4)
+    r.add_argument("--attempts", type=int, default=10)
     r.add_argument("--timeout", type=int, default=None, help="per-attempt seconds")
     r.add_argument("--token-file", default=DEFAULT_TOKEN_FILE)
     r.add_argument(
@@ -163,7 +172,11 @@ def main(argv=None) -> int:
         rc,
         reason=reason,
         jobid=jobid,
-        job=tr.attempts[-1] if tr.attempts else {},
+        job={
+            k: v
+            for k, v in (tr.attempts[-1] if tr.attempts else {}).items()
+            if k not in ("stdout", "stderr")
+        },
     )
     return rc
 
