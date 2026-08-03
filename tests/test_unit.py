@@ -121,7 +121,6 @@ def test_ladder_never_shrinks_below_the_allocation():
     print("OK ladder holds the node count")
 
 
-
 def test_environment_parsed_from_a_string_or_mapping():
     """Agents pass environment either way, and a bad one must say so."""
     from fluxsecretary.task import parse_env
@@ -132,6 +131,12 @@ def test_environment_parsed_from_a_string_or_mapping():
         "OMPI_MCA_pml": "ob1",
         "FI_PROVIDER": "tcp",
     }
+    # a value may hold commas; only a following KEY= ends it
+    assert parse_env("OMPI_MCA_btl=self,vader,tcp,OMPI_MCA_pml=ob1") == {
+        "OMPI_MCA_btl": "self,vader,tcp",
+        "OMPI_MCA_pml": "ob1",
+    }
+    assert parse_env("A=1 B=2") == {"A": "1", "B": "2"}
     try:
         parse_env("not-a-pair")
     except ValueError as e:

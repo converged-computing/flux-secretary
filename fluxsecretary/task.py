@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import re
+
 import json
 from typing import Any
 
@@ -28,28 +30,35 @@ do with how the job was launched. Typical fixes: too many tasks
 for the cores present (reduce), one rank where the program needs several (raise),
 or omit tasks and let Flux size the job.
 
-On your first attempts you should not change the command, the application, or its problem size. 
-After that please do your best to get it working. A solution is NOT changing the initial intent 
+On your first attempts you should not change the command, the application, or its problem size.
+After that please do your best to get it working. A solution is NOT changing the initial intent
 (e.g., a run on one node is not a solution to a fabric issue).
 
 Stop as soon as a launch succeeds."""
 
 
 def parse_env(value) -> dict:
-    """Environment from a mapping or a "K=V,K=V" string."""
+    """Environment from a mapping, or from "K=V" pairs separated by commas or spaces.
+
+    Values may themselves contain commas (OMPI_MCA_btl=self,vader,tcp), so a
+    separator only counts where the next token starts a new KEY=.
+    """
     if not value:
         return {}
     if isinstance(value, dict):
         return {str(k): str(v) for k, v in value.items()}
+    text = str(value).strip()
+    if not text:
+        return {}
     out = {}
-    for pair in str(value).split(","):
-        pair = pair.strip()
+    for pair in re.split(r"[,\s]+(?=[A-Za-z_][A-Za-z0-9_]*=)", text):
+        pair = pair.strip().strip(",")
         if not pair:
             continue
         if "=" not in pair:
             raise ValueError(
-                f"cannot parse environment {pair!r}: expected KEY=VALUE, "
-                f"comma separated"
+                f"cannot parse environment {pair!r}: expected KEY=VALUE pairs "
+                f"separated by commas or spaces"
             )
         k, _, v = pair.partition("=")
         out[k.strip()] = v.strip()
