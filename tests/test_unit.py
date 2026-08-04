@@ -158,6 +158,305 @@ def test_submit_command_shows_the_environment():
     print("OK environment shown in the attempt banner")
 
 
+def test_cwd_is_rendered_in_the_submit_command():
+    """A watcher has to see which directory an attempt ran in."""
+    from fluxsecretary.launch import Plan
+
+    line = Plan(nodes=2, tasks=2, cwd="/opt/lammps/examples/reaxff/HNS").submit_command(
+        ["lmp", "-in", "in.reaxff.hns"]
+    )
+    assert "--cwd /opt/lammps/examples/reaxff/HNS" in line, line
+    assert Plan(nodes=1).submit_command(["a"]) == "flux submit -N 1 a"
+    print("OK cwd shown in the attempt banner")
+
+
+def test_find_file_refuses_to_choose_between_inputs():
+    """Two directories holding the same filename are different inputs, and
+    picking one silently changes what the benchmark measures."""
+    import asyncio
+    import json
+    import os
+    import tempfile
+
+    from fluxsecretary.report import Transcript
+    from fluxsecretary.task import LaunchTask
+
+    task = LaunchTask(command=["lmp"], want_nodes=1, timeout=60, max_attempts=4)
+    tools = {
+        t.name: t
+        for t in task.tools(
+            {"nodes": 1, "cores": 2, "gpus": 0}, Transcript(command=["lmp"])
+        )
+    }
+    assert "find_file" in tools, sorted(tools)
+
+    call = lambda name: json.loads(
+        asyncio.run(tools["find_file"].handler({"name": name}))["content"][0]["text"]
+    )
+    # a path, not a name, is rejected rather than searched for
+    assert "error" in call("/etc/passwd")
+    # a name that cannot exist reports nothing found, not a guess
+    assert call("definitely-not-here-9271.dat")["directories"] == []
+    print("OK find_file is bounded and refuses ambiguity")
+
+
+def test_inspect_binary_reads_how_it_was_built():
+    """An allocation reporting GPUs does not mean the application can use them.
+
+    metric-kripke-cpu and metric-kripke-gpu differ only in how they were compiled,
+    so the binary decides. A statically linked CUDA build has no libcuda in NEEDED
+    at all and is only visible from its embedded device code.
+    """
+    import asyncio
+    import json
+    import os
+    import shutil
+    import subprocess
+    import tempfile
+
+    from fluxsecretary.report import Transcript
+    from fluxsecretary.task import LaunchTask
+
+    task = LaunchTask(command=["x"], want_nodes=1, timeout=60, max_attempts=4)
+    tools = {
+        t.name: t
+        for t in task.tools(
+            {"nodes": 1, "cores": 2, "gpus": 0}, Transcript(command=["x"])
+        )
+    }
+    assert "inspect_binary" in tools, sorted(tools)
+    call = lambda p: json.loads(
+        asyncio.run(tools["inspect_binary"].handler({"path": p}))["content"][0]["text"]
+    )
+
+    # something that is not there at all
+    missing = call("definitely-not-a-binary-9271")
+    assert missing["found"] is False, missing
+
+    # a real cpu binary
+    if shutil.which("readelf") and shutil.which("ls"):
+        cpu = call("ls")
+        assert cpu["found"] is True, cpu
+        assert cpu["accelerator"] == "none", cpu
+        assert cpu["needed"], "a dynamic binary has NEEDED entries"
+
+        # and a statically linked cuda build, which linkage alone cannot see
+        if shutil.which("gcc") and shutil.which("objcopy"):
+            with tempfile.TemporaryDirectory() as d:
+                src = os.path.join(d, "t.c")
+                open(src, "w").write("int main(void){return 0;}\n")
+                plain = os.path.join(d, "plain")
+                if (
+                    subprocess.run(
+                        ["gcc", "-o", plain, src], capture_output=True
+                    ).returncode
+                    == 0
+                ):
+                    blob = os.path.join(d, "b.bin")
+                    open(blob, "w").write("device code")
+                    fat = os.path.join(d, "static_cuda")
+                    if (
+                        subprocess.run(
+                            [
+                                "objcopy",
+                                "--add-section",
+                                f".nv_fatbin={blob}",
+                                "--set-section-flags",
+                                ".nv_fatbin=noload,readonly",
+                                plain,
+                                fat,
+                            ],
+                            capture_output=True,
+                        ).returncode
+                        == 0
+                    ):
+                        got = call(fat)
+                        assert got["accelerator"] == "cuda", got
+                        assert ".nv_fatbin" in got["device_code_sections"], got
+                        assert not got["gpu_libs"], "nothing in NEEDED to find"
+    print("OK inspect_binary reports how the workload was built")
+
+
+def test_ladder_plans_are_all_submittable():
+    """flux rejects a jobspec with more nodes than tasks.
+
+    The ladder's last rung is "let flux size the job", which arrives as tasks=None.
+    Defaulting that to 1 asked for N nodes and one task, and from_command raised
+    before anything ran.
+    """
+    from fluxsecretary.launch import ladder
+
+    for nodes, cores in ((1, 1), (4, 4), (4, 32), (2, 16), (5, 5)):
+        for plan in ladder({"nodes": nodes, "cores": cores, "gpus": 0}, nodes):
+            tasks = plan.tasks or plan.nodes or 1
+            assert plan.nodes <= tasks, (
+                f"{nodes} nodes / {cores} cores: nodes={plan.nodes} "
+                f"tasks={plan.tasks} would be rejected by flux"
+            )
+    print("OK every ladder rung has tasks >= nodes")
+
+
+def test_no_gpu_affinity_without_gpus():
+    """Rejecting gpu_affinity='off' forced the agent into 'per-task'.
+
+    That asks the shell to place tasks onto devices the job was never given, on a
+    CPU build that had correctly asked for no GPUs.
+    """
+    import asyncio
+    import json
+
+    import fluxsecretary.task as T
+    from fluxsecretary.report import Transcript
+    from fluxsecretary.task import LaunchTask
+
+    seen = []
+
+    class FakeIO:
+        @staticmethod
+        def submit_and_wait(cmd, **kw):
+            seen.append(kw)
+            return {
+                "rc": 0,
+                "jobid": "f1",
+                "runtime": 1.0,
+                "stdout": "",
+                "stderr": "",
+                "exceptions": [],
+            }
+
+    task = LaunchTask(command=["app"], want_nodes=4, timeout=600, max_attempts=6)
+    tools = {
+        t.name: t
+        for t in task.tools(
+            {"nodes": 4, "cores": 32, "gpus": 4}, Transcript(command=["app"])
+        )
+    }
+    real, T.fluxio = T.fluxio, FakeIO
+    try:
+        base = {"nodes": 4, "tasks": 4, "cores_per_task": 8, "cpu_affinity": "per-task"}
+        r = json.loads(
+            asyncio.run(
+                tools["try_launch"].handler(
+                    {**base, "gpus_per_task": 0, "gpu_affinity": "off"}
+                )
+            )["content"][0]["text"]
+        )
+        assert "error" not in r, r
+        assert seen[-1]["gpu_affinity"] is None, seen[-1]
+
+        asyncio.run(
+            tools["try_launch"].handler(
+                {**base, "gpus_per_task": 0, "gpu_affinity": "per-task"}
+            )
+        )
+        assert seen[-1]["gpu_affinity"] is None, seen[-1]
+
+        asyncio.run(
+            tools["try_launch"].handler(
+                {**base, "gpus_per_task": 1, "gpu_affinity": "per-task"}
+            )
+        )
+        assert seen[-1]["gpu_affinity"] == "per-task", seen[-1]
+        assert seen[-1]["gpus_per_task"] == 1, seen[-1]
+        assert all(k["duration"] == 600 for k in seen), seen
+    finally:
+        T.fluxio = real
+    print("OK no gpu affinity without gpus, and attempts are bounded")
+
+
+def test_intent_is_appended_without_replacing_the_rules():
+    """What a run is FOR is something only the submitter knows.
+
+    It changes what counts as a correct launch: a scaling study that must span
+    four nodes is not satisfied by a run that fits on one, however green the exit
+    code. It is appended, so the standing rules still apply and the agent can tell
+    the two apart.
+    """
+    from fluxsecretary.task import SYSTEM, LaunchTask
+
+    plain = LaunchTask(command=["x"], want_nodes=2)
+    assert plain.setup_system_prompt() == SYSTEM
+    assert plain.execute_system_prompt({}) == SYSTEM
+
+    text = "This is a strong-scaling study. The run must span all four nodes."
+    with_intent = LaunchTask(command=["x"], want_nodes=2, intent=text)
+    got = with_intent.setup_system_prompt()
+
+    assert got.startswith(SYSTEM), "the standing rules must come first, intact"
+    assert text in got, got[-200:]
+    assert got.index(text) > got.index("get_resources"), "intent goes after the rules"
+    # the agent is told it does not override them
+    assert "does not override" in got
+    # and the execute prompt carries it too, not just setup
+    assert text in with_intent.execute_system_prompt({})
+
+    # whitespace only is the same as nothing
+    assert LaunchTask(command=["x"], intent="   \n  ").setup_system_prompt() == SYSTEM
+    assert LaunchTask(command=["x"], intent=None).setup_system_prompt() == SYSTEM
+    print("OK intent is appended to the prompt, not substituted for it")
+
+
+def test_agent_can_edit_args_but_not_the_executable():
+    """The prompt says the problem parameters may be edited, so a tool must exist.
+
+    Kripke rejects fewer than 8 directions before it decomposes anything, and no
+    layout, affinity or environment setting fixes that. Without a way to act, the
+    agent correctly reports the command cannot be edited and gives up.
+
+    Only the arguments are replaceable, and the substitution is recorded so a run
+    that changed the problem cannot be mistaken for one that did not.
+    """
+    import asyncio
+
+    import fluxsecretary.task as T
+    from fluxsecretary.report import Transcript
+    from fluxsecretary.task import LaunchTask
+
+    seen = []
+
+    class FakeIO:
+        @staticmethod
+        def submit_and_wait(cmd, **kw):
+            seen.append(list(cmd))
+            return {
+                "rc": 0,
+                "jobid": "f1",
+                "runtime": 1.0,
+                "stdout": "",
+                "stderr": "",
+                "exceptions": [],
+                "unallocated": False,
+            }
+
+    original = ["kripke", "--quad", "4", "--zones", "8,8,8"]
+    task = LaunchTask(command=original, want_nodes=2, timeout=60)
+    tr = Transcript(command=original)
+    tools = {t.name: t for t in task.tools({"nodes": 2, "cores": 4, "gpus": 0}, tr)}
+    real, T.fluxio = T.fluxio, FakeIO
+    try:
+        asyncio.run(tools["try_launch"].handler({"nodes": 2, "tasks": 2}))
+        assert seen[-1] == original, seen[-1]
+        assert tr.attempts[-1]["args_changed"] is None, tr.attempts[-1]
+
+        asyncio.run(
+            tools["try_launch"].handler(
+                {"nodes": 2, "tasks": 2, "args": "--quad 8 --zones 8,8,8"}
+            )
+        )
+        assert seen[-1] == ["kripke", "--quad", "8", "--zones", "8,8,8"], seen[-1]
+        assert seen[-1][0] == "kripke", "the executable is not the agent's to change"
+        assert tr.attempts[-1]["args_changed"] == "--quad 8 --zones 8,8,8", tr.attempts[
+            -1
+        ]
+
+        # whitespace is not an edit
+        asyncio.run(tools["try_launch"].handler({"nodes": 2, "tasks": 2, "args": "  "}))
+        assert seen[-1] == original, seen[-1]
+    finally:
+        T.fluxio = real
+    print("OK the agent can replace arguments, and it is recorded")
+
+
 if __name__ == "__main__":
     test_ladder_orders_most_to_least_specific()
     test_ladder_never_exceeds_the_allocation()
@@ -169,4 +468,11 @@ if __name__ == "__main__":
     test_ladder_never_shrinks_below_the_allocation()
     test_environment_parsed_from_a_string_or_mapping()
     test_submit_command_shows_the_environment()
+    test_cwd_is_rendered_in_the_submit_command()
+    test_find_file_refuses_to_choose_between_inputs()
+    test_inspect_binary_reads_how_it_was_built()
+    test_ladder_plans_are_all_submittable()
+    test_no_gpu_affinity_without_gpus()
+    test_intent_is_appended_without_replacing_the_rules()
+    test_agent_can_edit_args_but_not_the_executable()
     print("\nunit tests passed")

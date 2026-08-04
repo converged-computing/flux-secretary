@@ -112,9 +112,14 @@ def submit_and_wait(
 ) -> dict:
     """Submit via the SDK and wait for the job to finish."""
     h = h or handle()
+    # flux rejects a jobspec with more nodes than tasks, and "let flux size the
+    # job" arrives here as tasks=None: defaulting that to 1 asked for N nodes and
+    # one task, and from_command raised before anything ran.
+    if not tasks:
+        tasks = nodes or 1
     spec = JobspecV1.from_command(
         command=list(command),
-        num_tasks=tasks or 1,
+        num_tasks=tasks,
         num_nodes=nodes,
         cores_per_task=cores_per_task or 1,
         gpus_per_task=gpus_per_task,
