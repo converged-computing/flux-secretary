@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import pathlib
 import sys
 
 from . import flux as fluxio
@@ -16,6 +17,11 @@ from .token import (
     read_token,
     resolve_backend,
 )
+
+# Seconds one attempt may run unless told otherwise. This becomes the flux job's
+# duration, so it is what stops a launch that will not finish; with no limit an
+# attempt that hangs consumes the whole run and nothing is recorded.
+DEFAULT_ATTEMPT_SECONDS = 600
 
 
 def run_deterministic(command, want_nodes, tr, timeout, max_attempts):
@@ -44,7 +50,7 @@ def run_deterministic(command, want_nodes, tr, timeout, max_attempts):
             cpu_affinity=plan.cpu_affinity,
             gpu_affinity=plan.gpu_affinity,
             exclusive=plan.exclusive,
-            duration=timeout,
+            duration=timeout or None,
             h=h,
         )
         last = out
@@ -71,13 +77,19 @@ def run_deterministic(command, want_nodes, tr, timeout, max_attempts):
     )
 
 
-def run_agent(command, want_nodes, tr, timeout, max_attempts, backend, model):
+def run_agent(
+    command, want_nodes, tr, timeout, max_attempts, backend, model, intent=None
+):
     from behalf import make_runner
 
     from .task import LaunchTask
 
     task = LaunchTask(
-        command, want_nodes=want_nodes, max_attempts=max_attempts, timeout=timeout
+        command,
+        want_nodes=want_nodes,
+        max_attempts=max_attempts,
+        timeout=timeout,
+        intent=intent,
     )
     task.transcript = tr
     runner = make_runner(backend=backend, model=model)
@@ -102,7 +114,25 @@ def main(argv=None) -> int:
         help="requested node count (default: all the allocation has)",
     )
     r.add_argument("--attempts", type=int, default=10)
-    r.add_argument("--timeout", type=int, default=None, help="per-attempt seconds")
+    r.add_argument(
+        "--intent",
+        default=None,
+        help="text appended to the agent's prompt: what this run is for, and any "
+        "constraint only the submitter knows. Does not override the standing rules.",
+    )
+    r.add_argument(
+        "--intent-file",
+        default=None,
+        help="read --intent from a file, for anything longer than a shell argument "
+        "will comfortably carry",
+    )
+    r.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_ATTEMPT_SECONDS,
+        help="seconds one attempt may run; becomes the flux job's duration. 0 for "
+        "no limit, which lets a launch that never returns consume the whole run.",
+    )
     r.add_argument("--token-file", default=DEFAULT_TOKEN_FILE)
     r.add_argument(
         "--backend", default=os.environ.get("FLUX_SECRETARY_BACKEND", "auto")
@@ -132,6 +162,16 @@ def main(argv=None) -> int:
     token, source = read_token(args.token_file)
     backend = resolve_backend(args.backend, source)
     use_agent = bool(token) and bool(backend) and not args.deterministic
+    intent = args.intent or ""
+    if args.intent_file:
+        try:
+            from_file = pathlib.Path(args.intent_file).read_text().strip()
+        except OSError as e:
+            print(f"cannot read --intent-file {args.intent_file}: {e}", file=sys.stderr)
+            return 2
+        # Both given: concatenate rather than silently dropping one.
+        intent = f"{intent}\n\n{from_file}".strip() if intent else from_file
+
     exported = export_token(token, backend, args.token_env) if token else "-"
     tr.mode = "agent" if use_agent else "deterministic"
     emit(
@@ -141,7 +181,14 @@ def main(argv=None) -> int:
         exported_as=exported,
         backend=backend or "-",
         attempts_max=args.attempts,
+        # so a transcript records that the agent was given extra instructions,
+        # and how much
+        intent_chars=len(intent) or "-",
     )
+    if intent:
+        section("intent")
+        for line in intent.splitlines():
+            note(line)
 
     rc, jobid, reason = 1, None, ""
     if use_agent:
@@ -154,6 +201,7 @@ def main(argv=None) -> int:
                 args.attempts,
                 backend,
                 args.model,
+                intent,
             )
         except BaseException as e:  # noqa: BLE001
             note(f"agent unavailable ({e}); falling back to deterministic")

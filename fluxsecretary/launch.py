@@ -17,6 +17,7 @@ class Plan:
     cpu_affinity: str | None = None
     gpu_affinity: str | None = None
     exclusive: bool = False
+    cwd: str | None = None
     extra: list = field(default_factory=list)
     why: str = ""
 
@@ -33,6 +34,8 @@ class Plan:
             parts += ["-g", str(self.gpus_per_task)]
         if self.exclusive:
             parts += ["--exclusive"]
+        if self.cwd:
+            parts += ["--cwd", self.cwd]
         if self.cpu_affinity:
             parts += ["-o", f"cpu-affinity={self.cpu_affinity}"]
         if self.gpu_affinity:
@@ -51,6 +54,7 @@ class Plan:
             "cpu_affinity": self.cpu_affinity,
             "gpu_affinity": self.gpu_affinity,
             "exclusive": self.exclusive or None,
+            "cwd": self.cwd,
             "why": self.why,
         }
 

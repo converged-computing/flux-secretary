@@ -70,6 +70,66 @@ def test_application_output_is_captured():
     print("OK application output captured")
 
 
+def test_intent_flags_reach_the_transcript():
+    """--intent and --intent-file combine, and a missing file is an error."""
+    import contextlib
+    import io
+    import tempfile
+    import os
+
+    from fluxsecretary.cli import main
+
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "intent.txt")
+        open(path, "w").write("Prefer a layout that spans every node.\n")
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(
+                [
+                    "run",
+                    "--nodes",
+                    "1",
+                    "--model",
+                    "none",
+                    "--intent",
+                    "From the flag.",
+                    "--intent-file",
+                    path,
+                    "--",
+                    "sh",
+                    "-c",
+                    "echo hi",
+                ]
+            )
+        out = buf.getvalue()
+        assert rc == 0, out
+        assert "From the flag." in out, out
+        assert "spans every node" in out, out
+        assert "intent_chars=" in out, out
+
+        # a file that cannot be read must fail, not run with no intent
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = main(
+                [
+                    "run",
+                    "--nodes",
+                    "1",
+                    "--model",
+                    "none",
+                    "--intent-file",
+                    os.path.join(d, "nope.txt"),
+                    "--",
+                    "sh",
+                    "-c",
+                    "echo hi",
+                ]
+            )
+        assert rc == 2, (rc, buf.getvalue())
+    print("OK intent flags combine, and a missing file is an error")
+
+
 if __name__ == "__main__":
     for fn in (
         test_resources_are_read_from_the_broker,
@@ -78,6 +138,7 @@ if __name__ == "__main__":
         test_nonzero_exit_is_reported_without_an_exception,
         test_exit_code_conversion,
         test_application_output_is_captured,
+        test_intent_flags_reach_the_transcript,
     ):
         fn()
     print("\nintegration tests passed")
