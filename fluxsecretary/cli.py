@@ -6,7 +6,9 @@ import argparse
 import asyncio
 import os
 import pathlib
+import random
 import sys
+import time
 
 from . import flux as fluxio
 from .launch import ladder
@@ -77,9 +79,79 @@ def run_deterministic(command, want_nodes, tr, timeout, max_attempts):
     )
 
 
+# Errors that mean "ask again later" rather than "this will not work".
+#
+# A hosted model API is unavailable sometimes, and losing the agent is not a
+# neutral event: the deterministic ladder only varies task layout, so a failure
+# that needs an environment change — an MPI transport that crashes in MPI_Init,
+# say — is unrecoverable without it. Falling back on the first 503 turns a
+# provider hiccup into a failed run.
+TRANSIENT = (
+    "serviceunavailable",
+    "throttling",
+    "toomanyrequests",
+    "modelnotready",
+    "modeltimeout",
+    "internalserver",
+    "internalfailure",
+    "requesttimeout",
+    "connectionerror",
+    "readtimeout",
+    "timeouterror",
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "reached max retries",
+    "temporarily unavailable",
+)
+
+
+def is_transient(exc: BaseException) -> bool:
+    """Whether retrying could plausibly help.
+
+    Matched on the message rather than the type: each backend raises its own
+    exception classes (botocore, google, anthropic), and importing all of them to
+    name them would couple this to providers that may not be installed.
+    """
+    text = f"{type(exc).__name__} {exc}".lower()
+    if any(
+        word in text
+        for word in (
+            "accessdenied",
+            "unauthorized",
+            "forbidden",
+            "invalidsignature",
+            "expiredtoken",
+            "validationexception",
+            "notfound",
+        )
+    ):
+        return False  # credentials or a bad request: waiting changes nothing
+    return any(word in text for word in TRANSIENT)
+
+
 def run_agent(
-    command, want_nodes, tr, timeout, max_attempts, backend, model, intent=None
+    command,
+    want_nodes,
+    tr,
+    timeout,
+    max_attempts,
+    backend,
+    model,
+    intent=None,
+    api_retries=4,
+    api_backoff=5.0,
+    api_backoff_max=120.0,
 ):
+    """Run the agent, retrying the API through transient outages.
+
+    Retrying is safe because the attempt budget is counted against the transcript,
+    which persists across calls: a resumed agent cannot exceed --attempts however
+    many times the API drops. What it can do is repeat a launch it already made,
+    so each retry is recorded and the transcript shows how the run really went.
+    """
     from behalf import make_runner
 
     from .task import LaunchTask
@@ -93,7 +165,42 @@ def run_agent(
     )
     task.transcript = tr
     runner = make_runner(backend=backend, model=model)
-    outcome = asyncio.run(task.execute(runner, {"goal": "launch"}, lambda n, a: True))
+
+    delay, last = api_backoff, None
+    for try_n in range(1, max(1, api_retries + 1) + 1):
+        try:
+            outcome = asyncio.run(
+                task.execute(runner, {"goal": "launch"}, lambda n, a: True)
+            )
+            break
+        except BaseException as e:  # noqa: BLE001 - classified below
+            last = e
+            if not is_transient(e) or try_n > api_retries:
+                raise
+            if len(tr.attempts) >= max_attempts:
+                # The budget is spent; another round could not launch anything.
+                raise
+            wait = min(delay, api_backoff_max)
+            # Jitter, so several concurrent secretaries do not retry in lockstep
+            # and re-create the outage they are waiting out.
+            wait *= 0.5 + random.random()
+            note(
+                f"api unavailable ({type(e).__name__}: {str(e)[:120]}); "
+                f"retry {try_n}/{api_retries} in {wait:.0f}s"
+            )
+            emit(
+                "api_retry",
+                attempt=try_n,
+                of=api_retries,
+                wait_s=round(wait, 1),
+                error=f"{type(e).__name__}: {str(e)[:160]}",
+                launches_so_far=len(tr.attempts),
+            )
+            time.sleep(wait)
+            delay *= 2
+    else:  # pragma: no cover - the loop always breaks or raises
+        raise last
+
     if outcome and outcome.get("rc") == 0:
         return 0, outcome.get("jobid"), ""
     if outcome and outcome.get("refused"):
@@ -114,6 +221,27 @@ def main(argv=None) -> int:
         help="requested node count (default: all the allocation has)",
     )
     r.add_argument("--attempts", type=int, default=10)
+    r.add_argument(
+        "--api-retries",
+        type=int,
+        default=4,
+        help="how many times to retry the model API through a transient outage. "
+        "Losing the agent is not neutral: the deterministic ladder varies task "
+        "layout only, so a failure needing an environment change is "
+        "unrecoverable without it. 0 to fall back immediately.",
+    )
+    r.add_argument(
+        "--api-backoff",
+        type=float,
+        default=5.0,
+        help="seconds before the first API retry, doubling each time, with jitter",
+    )
+    r.add_argument(
+        "--api-backoff-max",
+        type=float,
+        default=120.0,
+        help="ceiling on the API retry delay",
+    )
     r.add_argument(
         "--intent",
         default=None,
@@ -184,6 +312,7 @@ def main(argv=None) -> int:
         # so a transcript records that the agent was given extra instructions,
         # and how much
         intent_chars=len(intent) or "-",
+        api_retries=args.api_retries,
     )
     if intent:
         section("intent")
@@ -202,6 +331,9 @@ def main(argv=None) -> int:
                 backend,
                 args.model,
                 intent,
+                api_retries=args.api_retries,
+                api_backoff=args.api_backoff,
+                api_backoff_max=args.api_backoff_max,
             )
         except BaseException as e:  # noqa: BLE001
             note(f"agent unavailable ({e}); falling back to deterministic")

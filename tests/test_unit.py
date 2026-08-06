@@ -457,6 +457,136 @@ def test_agent_can_edit_args_but_not_the_executable():
     print("OK the agent can replace arguments, and it is recorded")
 
 
+def test_api_retries_transient_outages_then_gives_up():
+    """A hosted model API is unavailable sometimes, and losing the agent is not a
+    neutral event: the deterministic ladder varies task layout only, so a failure
+    needing an environment change — an MPI transport crashing in MPI_Init — cannot
+    be recovered without it. In one iteration of the study, 4 of 20 runs lost the
+    agent to Bedrock 503s and every one of them failed or timed out.
+    """
+    import fluxsecretary.cli as cli
+    from fluxsecretary.report import Transcript
+
+    class Unavailable(Exception):
+        pass
+
+    calls = {"n": 0}
+    slept = []
+
+    def fake_execute(*a, **kw):
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise Unavailable(
+                "An error occurred (ServiceUnavailableException) when calling "
+                "the ConverseStream operation (reached max retries: 4)"
+            )
+        return {"rc": 0, "jobid": "f1"}
+
+    class FakeTask:
+        def __init__(self, *a, **kw):
+            self.transcript = None
+
+        async def execute(self, *a, **kw):
+            return fake_execute()
+
+    real_sleep, cli.time.sleep = cli.time.sleep, slept.append
+    try:
+        import sys
+        import types
+
+        mod = types.ModuleType("behalf")
+        mod.make_runner = lambda **kw: object()
+        sys.modules.setdefault("behalf", mod)
+        import fluxsecretary.task as T
+
+        real_task, T.LaunchTask = T.LaunchTask, FakeTask
+        try:
+            tr = Transcript(command=["app"])
+            rc, jid, reason = cli.run_agent(
+                ["app"],
+                2,
+                tr,
+                600,
+                10,
+                "aws",
+                "m",
+                api_retries=4,
+                api_backoff=1.0,
+            )
+        finally:
+            T.LaunchTask = real_task
+    finally:
+        cli.time.sleep = real_sleep
+
+    assert rc == 0 and jid == "f1", (rc, jid, reason)
+    assert (
+        calls["n"] == 3
+    ), f"should have retried twice then succeeded, got {calls['n']}"
+    assert len(slept) == 2, f"one sleep per retry, got {slept}"
+    # exponential, and jittered so concurrent secretaries do not retry in lockstep
+    assert slept[1] > slept[0], f"backoff must grow: {slept}"
+    assert all(0 < s for s in slept), slept
+    print("OK the API is retried through a transient outage")
+
+
+def test_api_does_not_retry_what_will_not_improve():
+    """Credentials and bad requests do not get better by waiting, and retrying
+    them only delays the fallback that might still work."""
+    import fluxsecretary.cli as cli
+    from fluxsecretary.report import Transcript
+
+    class AccessDeniedException(Exception):
+        pass
+
+    calls = {"n": 0}
+
+    class FakeTask:
+        def __init__(self, *a, **kw):
+            self.transcript = None
+
+        async def execute(self, *a, **kw):
+            calls["n"] += 1
+            raise AccessDeniedException("User is not authorized to perform bedrock:*")
+
+    slept = []
+    real_sleep, cli.time.sleep = cli.time.sleep, slept.append
+    try:
+        import sys
+        import types
+
+        mod = types.ModuleType("behalf")
+        mod.make_runner = lambda **kw: object()
+        sys.modules.setdefault("behalf", mod)
+        import fluxsecretary.task as T
+
+        real_task, T.LaunchTask = T.LaunchTask, FakeTask
+        try:
+            raised = False
+            try:
+                cli.run_agent(
+                    ["app"],
+                    2,
+                    Transcript(command=["app"]),
+                    600,
+                    10,
+                    "aws",
+                    "m",
+                    api_retries=4,
+                    api_backoff=1.0,
+                )
+            except AccessDeniedException:
+                raised = True
+        finally:
+            T.LaunchTask = real_task
+    finally:
+        cli.time.sleep = real_sleep
+
+    assert raised, "an auth error must propagate so the caller can fall back"
+    assert calls["n"] == 1, f"must not retry an auth error, tried {calls['n']}"
+    assert not slept, f"must not sleep before giving up: {slept}"
+    print("OK an unrecoverable error falls back at once")
+
+
 if __name__ == "__main__":
     test_ladder_orders_most_to_least_specific()
     test_ladder_never_exceeds_the_allocation()
@@ -475,4 +605,6 @@ if __name__ == "__main__":
     test_no_gpu_affinity_without_gpus()
     test_intent_is_appended_without_replacing_the_rules()
     test_agent_can_edit_args_but_not_the_executable()
+    test_api_retries_transient_outages_then_gives_up()
+    test_api_does_not_retry_what_will_not_improve()
     print("\nunit tests passed")
